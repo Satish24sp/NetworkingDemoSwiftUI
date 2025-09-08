@@ -34,13 +34,14 @@ final class APIService {
         }
     }
     
-    // MARK: - Request Method
+    // MARK: - Generic API Request Method
     func request<T: Decodable & Sendable>(
         _ endpoint: Endpoint,
         responseType: T.Type
     ) async throws -> BaseResponseModel<T> {
         let request = try endpoint.urlRequest(baseURL: baseURL)
-        debugPrintRequest(request)
+        // Log Request
+        NetworkDebugHelper.shared.logRequest(request)
         
         let (data, response) = try await session.data(for: request)
         guard let httpResponse = response as? HTTPURLResponse else {
@@ -53,16 +54,28 @@ final class APIService {
         
         // Use HTTPStatusHandler
         try HTTPStatusHandler.handle(httpResponse.statusCode)
-        
-        debugPrintResponse(data, response: httpResponse)
-        
-        guard let httpResponse = response as? HTTPURLResponse else {
+        // Log Response
+        NetworkDebugHelper.shared.logResponse(data: data, response: response, error: nil)
+
+        guard let _ = response as? HTTPURLResponse else {
             throw NetworkError.invalidResponse
         }
         
         do {
-            // Decode BaseResponseModel<T>
-            return try JSONDecoder().decode(BaseResponseModel<T>.self, from: data)
+//            // Decode BaseResponseModel<T>
+//            return try JSONDecoder().decode(BaseResponseModel<T>.self, from: data)
+            
+            let decoder = JSONDecoder()
+            
+            // Try decoding BaseResponseModel<T> first
+            if let wrapped = try? decoder.decode(BaseResponseModel<T>.self, from: data) {
+                return wrapped
+            }
+            
+            // If decoding failed, fallback to plain T and wrap it manually
+            let plain = try decoder.decode(T.self, from: data)
+            return BaseResponseModel(status: true, message: nil, data: plain)
+            
         } catch let error as DecodingError {
             throw NetworkError.decodingError(error)
         } catch {
@@ -70,8 +83,57 @@ final class APIService {
         }
     }
     
+    // MARK: - Upload and Download File
+    // Upload File
+        func upload<T: Codable>(
+            url: String,
+            fileURL: URL,
+            headers: [String: String] = [:],
+            responseType: T.Type
+        ) async throws -> T {
+            guard let url = URL(string: url) else { throw NetworkError.invalidURL }
+
+            var request = URLRequest(url: url)
+            request.httpMethod = HTTPMethod.POST.rawValue
+            headers.forEach { request.setValue($1, forHTTPHeaderField: $0) }
+
+            do {
+                let (data, response) = try await session.upload(for: request, fromFile: fileURL)
+                guard let httpResponse = response as? HTTPURLResponse,
+                      200..<300 ~= httpResponse.statusCode else {
+                    throw NetworkError.invalidResponse
+                }
+                return try JSONDecoder().decode(T.self, from: data)
+            } catch let error as DecodingError {
+                throw NetworkError.decodingError(error)
+            } catch {
+                throw NetworkError.requestFailed(error)
+            }
+        }
+
+        // Download File
+        func download(
+            url: String,
+            destination: URL
+        ) async throws -> URL {
+            guard let url = URL(string: url) else { throw NetworkError.invalidURL }
+
+            do {
+                let (tempURL, response) = try await session.download(from: url)
+                guard let httpResponse = response as? HTTPURLResponse,
+                      200..<300 ~= httpResponse.statusCode else {
+                    throw NetworkError.invalidResponse
+                }
+                let fileManager = FileManager.default
+                try? fileManager.removeItem(at: destination) // remove old file if exists
+                try fileManager.moveItem(at: tempURL, to: destination)
+                return destination
+            } catch {
+                throw NetworkError.fileSaveFailed
+            }
+        }
     
-    // MARK: - Upload Multipart
+    // MARK: - Upload Multipart without progress
     func uploadMultipart<T: Codable>(
         url: String,
         parameters: [String: String] = [:],
@@ -122,7 +184,7 @@ final class APIService {
         }
     }
     
-    
+    // MARK: - Upload Multipart with progress
     func uploadMultipartWithProgress<T: Codable>(
         url: String,
         parameters: [String: String] = [:],
@@ -187,38 +249,6 @@ final class APIService {
         }
     }
     
-    
-    // MARK: - Debug Helpers
-    private func debugPrintRequest(_ request: URLRequest) {
-#if DEBUG
-        print("\n---- REQUEST ----")
-        if let url = request.url { print("URL: \(url)") }
-        if let method = request.httpMethod { print("Method: \(method)") }
-        if let headers = request.allHTTPHeaderFields { print("Headers: \(headers)") }
-        if let body = request.httpBody,
-           let json = try? JSONSerialization.jsonObject(with: body),
-           let pretty = try? JSONSerialization.data(withJSONObject: json, options: .prettyPrinted),
-           let prettyString = String(data: pretty, encoding: .utf8) {
-            print("Body:\n\(prettyString)")
-        }
-        print("---- END REQUEST ----\n")
-#endif
-    }
-    
-    private func debugPrintResponse(_ data: Data, response: HTTPURLResponse) {
-#if DEBUG
-        print("\n---- RESPONSE ----")
-        print("Status: \(response.statusCode)")
-        if let json = try? JSONSerialization.jsonObject(with: data),
-           let pretty = try? JSONSerialization.data(withJSONObject: json, options: .prettyPrinted),
-           let prettyString = String(data: pretty, encoding: .utf8) {
-            print("Body:\n\(prettyString)")
-        } else {
-            print("Raw Data: \(data)")
-        }
-        print("---- END RESPONSE ----\n")
-#endif
-    }
 }
 
 // MARK: - SSL Pinning Session Delegate Via Certificate files
